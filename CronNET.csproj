@@ -1,8 +1,9 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <TargetFrameworks>netstandard2.0;netstandard2.1;net8.0;net9.0</TargetFrameworks>
-    <Version>2.2026.0924.2</Version>
+    <Version>2.2026.0925.0</Version>
+    <Authors>allentsou</Authors>
     <Description>A lightweight minute-level cron scheduler for .NET featuring Task-based cooperative cancellation, overlap prevention, precise minute alignment, and graceful shutdown.</Description>
     <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
     <PackageId>CronNETStd</PackageId>
@@ -12,6 +13,9 @@
     <NoWarn>$(NoWarn);1591</NoWarn>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/allentsou/CronNETStd</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/allentsou/CronNETStd.git</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
     <PackageTags>cron;cron-expression;scheduler;job-scheduler;cron-parser;dotnet;csharp</PackageTags>
   </PropertyGroup>
 
