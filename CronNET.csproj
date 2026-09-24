@@ -3,7 +3,7 @@
   <PropertyGroup>
     <TargetFrameworks>netstandard2.0;netstandard2.1;net8.0;net9.0</TargetFrameworks>
     <Version>2.2026.0924.1</Version>
-    <Description>輕量分鐘級 cron 排程器：Task + CancellationToken 協作式取消，精準對齊分鐘觸發。支援標準 5 欄 Cron 語法、防重疊執行與優雅關機收尾。</Description>
+    <Description>A lightweight minute-level cron scheduler for .NET featuring Task-based cooperative cancellation, overlap prevention, precise minute alignment, and graceful shutdown.</Description>
     <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
     <PackageId>CronNETStd</PackageId>
     <LangVersion>latest</LangVersion>
