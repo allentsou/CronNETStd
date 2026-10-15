@@ -5,27 +5,41 @@ using System.Linq;
 
 namespace CronNET
 {
+    /// <summary>
+    /// Defines a cron schedule contract.
+    /// <para>定義 Cron 排程合約介面。</para>
+    /// </summary>
     public interface ICronSchedule
     {
+        /// <summary>
+        /// Validates whether the given cron expression is valid.
+        /// <para>驗證指定的 Cron 表達式格式是否有效。</para>
+        /// </summary>
         bool IsValid(string expression);
+
+        /// <summary>
+        /// Determines whether the specified date and time matches this schedule.
+        /// <para>判斷指定的日期與時間是否符合此排程。</para>
+        /// </summary>
         bool IsTime(DateTime dateTime);
     }
 
     /// <summary>
-    /// 標準 5 欄 cron 解析器：分 時 日 月 週
-    /// 語法支援：*、?、*/n、start/n、a-b、a-b/n、a,b,c（含 union，如 1,2-5/2）
-    /// 欄位範圍：分 0-59、時 0-23、日 1-31、月 1-12、週 0-6（7 視為週日別名）。
-    /// 日與週之間為 AND 語意（皆須命中才執行）。
+    /// Standard 5-field cron expression parser: minute, hour, day of month, month, day of week.
+    /// <para>標準 5 欄式 Cron 表達式解析器：分、時、日、月、週。</para>
+    /// <para>語法支援：*、?、*/n、start/n、a-b、a-b/n、a,b,c（含 union，如 1,2-5/2）。</para>
+    /// <para>欄位範圍：分 0-59、時 0-23、日 1-31、月 1-12、週 0-6（7 視為週日別名）。</para>
+    /// <para>日與週之間為 AND 語意（皆須命中才執行）。</para>
     /// </summary>
     public class CronSchedule : ICronSchedule
     {
-        // 欄位邊界（閉區間）
+        // Field boundaries (closed intervals)
         private const int MinMinute = 0, MaxMinute = 59;
         private const int MinHour = 0, MaxHour = 23;
         private const int MinDayOfMonth = 1, MaxDayOfMonth = 31;
         private const int MinMonth = 1, MaxMonth = 12;
         private const int MinDayOfWeek = 0, MaxDayOfWeek = 6;
-        // 星期輸入上限 7（7 = 週日別名，正規化為 0）
+        // Upper input bound for day of week: 7 (7 = Sunday alias, normalized to 0)
         private const int MaxDayOfWeekInput = 7;
 
         private readonly string _expression;
@@ -35,43 +49,80 @@ namespace CronNET
         private readonly HashSet<int> _months;
         private readonly HashSet<int> _daysOfWeek;
 
-        // 快取 ReadOnlyCollection，避免每次屬性讀取都重複 OrderBy + ToList 配置記憶體
+        // Cache ReadOnlyCollection to avoid repeated OrderBy + ToList heap allocations on each property access
         private readonly ReadOnlyCollection<int> _readOnlyMinutes;
         private readonly ReadOnlyCollection<int> _readOnlyHours;
         private readonly ReadOnlyCollection<int> _readOnlyDaysOfMonth;
         private readonly ReadOnlyCollection<int> _readOnlyMonths;
         private readonly ReadOnlyCollection<int> _readOnlyDaysOfWeek;
 
+        /// <summary>
+        /// Gets the matched minutes (0-59).
+        /// <para>取得符合的分鐘清單（0-59）。</para>
+        /// </summary>
         public IReadOnlyCollection<int> Minutes => _readOnlyMinutes;
+
+        /// <summary>
+        /// Gets the matched hours (0-23).
+        /// <para>取得符合的小時清單（0-23）。</para>
+        /// </summary>
         public IReadOnlyCollection<int> Hours => _readOnlyHours;
+
+        /// <summary>
+        /// Gets the matched days of month (1-31).
+        /// <para>取得符合的日期清單（1-31）。</para>
+        /// </summary>
         public IReadOnlyCollection<int> DaysOfMonth => _readOnlyDaysOfMonth;
+
+        /// <summary>
+        /// Gets the matched months (1-12).
+        /// <para>取得符合的月份清單（1-12）。</para>
+        /// </summary>
         public IReadOnlyCollection<int> Months => _readOnlyMonths;
+
+        /// <summary>
+        /// Gets the matched days of week (0-6, Sunday is 0).
+        /// <para>取得符合的星期清單（0-6，0 為週日）。</para>
+        /// </summary>
         public IReadOnlyCollection<int> DaysOfWeek => _readOnlyDaysOfWeek;
+
+        /// <summary>
+        /// Gets the original cron expression string.
+        /// <para>取得原始的 Cron 表達式字串。</para>
+        /// </summary>
         public string Expression => _expression;
 
-        /// <summary>預設每分鐘。</summary>
+        /// <summary>
+        /// Initializes a new instance of <see cref="CronSchedule"/> defaulting to every minute (* * * * *).
+        /// <para>初始化 <see cref="CronSchedule"/> 類別的新執行個體，預設為每分鐘執行一次 (* * * * *)。</para>
+        /// </summary>
         public CronSchedule() : this("* * * * *")
         {
         }
 
+        /// <summary>
+        /// Initializes a new instance of <see cref="CronSchedule"/> with the specified cron expression.
+        /// <para>使用指定的 Cron 表達式初始化 <see cref="CronSchedule"/> 類別的新執行個體。</para>
+        /// </summary>
+        /// <param name="expression">Standard 5-field cron expression.<para>標準 5 欄式 Cron 表達式。</para></param>
         public CronSchedule(string expression)
         {
             if (string.IsNullOrWhiteSpace(expression))
-                throw new ArgumentException("Cron expression 不可為空。", nameof(expression));
+                throw new ArgumentException("Cron expression cannot be empty.", nameof(expression));
 
             _expression = expression.Trim();
             string[] fields = _expression.Split((char[])null, StringSplitOptions.RemoveEmptyEntries);
             if (fields.Length != 5)
                 throw new FormatException(
-                    $"Cron expression 必須恰好 5 個欄位（分 時 日 月 週），實際為 {fields.Length} 個：'{_expression}'。");
+                    $"Cron expression must have exactly 5 fields (minute, hour, day, month, day-of-week), but found {fields.Length}: '{_expression}'.");
 
             try
             {
-                _minutes = ParseField(fields[0], MinMinute, MaxMinute, "分", false);
-                _hours = ParseField(fields[1], MinHour, MaxHour, "時", false);
-                _daysOfMonth = ParseField(fields[2], MinDayOfMonth, MaxDayOfMonth, "日", false);
-                _months = ParseField(fields[3], MinMonth, MaxMonth, "月", false);
-                _daysOfWeek = ParseField(fields[4], MinDayOfWeek, MaxDayOfWeekInput, "週", true);
+                _minutes = ParseField(fields[0], MinMinute, MaxMinute, "minute", false);
+                _hours = ParseField(fields[1], MinHour, MaxHour, "hour", false);
+                _daysOfMonth = ParseField(fields[2], MinDayOfMonth, MaxDayOfMonth, "day of month", false);
+                _months = ParseField(fields[3], MinMonth, MaxMonth, "month", false);
+                _daysOfWeek = ParseField(fields[4], MinDayOfWeek, MaxDayOfWeekInput, "day of week", true);
 
                 _readOnlyMinutes = new ReadOnlyCollection<int>(_minutes.OrderBy(x => x).ToList());
                 _readOnlyHours = new ReadOnlyCollection<int>(_hours.OrderBy(x => x).ToList());
@@ -85,18 +136,25 @@ namespace CronNET
             }
             catch (Exception ex)
             {
-                throw new FormatException($"Cron expression 解析失敗：'{_expression}'。{ex.Message}", ex);
+                throw new FormatException($"Failed to parse cron expression: '{_expression}'. {ex.Message}", ex);
             }
         }
 
         /// <summary>
-        /// 靜態預檢 Cron 表達式格式是否有效。
+        /// Statically pre-checks whether a cron expression format is valid.
+        /// <para>靜態預檢 Cron 表達式格式是否有效。</para>
         /// </summary>
+        /// <param name="expression">The cron expression to validate.<para>欲驗證的 Cron 表達式。</para></param>
+        /// <returns>True if valid; otherwise, false.<para>若有效則為 true；否則為 false。</para></returns>
         public static bool IsValidExpression(string expression) => TryParse(expression, out _);
 
         /// <summary>
-        /// 嘗試解析 Cron 表達式，解析失敗回傳 false 而不拋出例外。
+        /// Attempts to parse a cron expression. Returns false instead of throwing if parsing fails.
+        /// <para>嘗試解析 Cron 表達式。解析失敗回傳 false 而不拋出例外。</para>
         /// </summary>
+        /// <param name="expression">The cron expression to parse.<para>欲解析的 Cron 表達式。</para></param>
+        /// <param name="schedule">The parsed <see cref="CronSchedule"/> instance if successful; otherwise, null.<para>若成功則包含解析後的 <see cref="CronSchedule"/> 實例；否則為 null。</para></param>
+        /// <returns>True if successfully parsed; otherwise, false.<para>若解析成功則為 true；否則為 false。</para></returns>
         public static bool TryParse(string expression, out CronSchedule schedule)
         {
             schedule = null;
@@ -113,8 +171,16 @@ namespace CronNET
             }
         }
 
+        /// <summary>
+        /// Validates whether the given cron expression is valid.
+        /// <para>驗證指定的 Cron 表達式格式是否有效。</para>
+        /// </summary>
         public bool IsValid(string expression) => IsValidExpression(expression);
 
+        /// <summary>
+        /// Determines whether the specified date and time matches this schedule.
+        /// <para>判斷指定的日期與時間是否符合此排程。</para>
+        /// </summary>
         public bool IsTime(DateTime dateTime)
         {
             return _minutes.Contains(dateTime.Minute) &&
@@ -125,8 +191,11 @@ namespace CronNET
         }
 
         /// <summary>
-        /// 預測指定時間點之後的下一次觸發時間。若 1 年內無符合時間則回傳 null。
+        /// Predicts the next occurrence time after the specified reference time. Returns null if no match within 1 year.
+        /// <para>預測指定時間點之後的下一次觸發時間。若 1 年內無符合時間則回傳 null。</para>
         /// </summary>
+        /// <param name="fromTime">The reference starting time.<para>起算基準時間。</para></param>
+        /// <returns>The next matching trigger time, or null if not found within a year.<para>下一次觸發時間，若一年內無匹配則為 null。</para></returns>
         public DateTime? GetNextOccurrence(DateTime fromTime)
         {
             DateTime cur = new DateTime(fromTime.Year, fromTime.Month, fromTime.Day, fromTime.Hour, fromTime.Minute, 0, fromTime.Kind).AddMinutes(1);
@@ -161,12 +230,12 @@ namespace CronNET
             return null;
         }
 
-        #region 解析內部實作
+        #region Internal Parsing Implementation
 
         private static HashSet<int> ParseField(string field, int min, int max, string fieldName, bool isDayOfWeek)
         {
             if (string.IsNullOrWhiteSpace(field))
-                throw new FormatException($"「{fieldName}」欄位不可為空。");
+                throw new FormatException($"The '{fieldName}' field cannot be empty.");
 
             var result = new HashSet<int>();
             string[] tokens = field.Split(',');
@@ -174,27 +243,27 @@ namespace CronNET
             {
                 string token = raw.Trim();
                 if (token.Length == 0)
-                    throw new FormatException($"「{fieldName}」欄位含空 token：'{field}'。");
+                    throw new FormatException($"The '{fieldName}' field contains an empty token: '{field}'.");
                 foreach (int v in ExpandToken(token, min, max, fieldName, isDayOfWeek))
                     result.Add(v);
             }
 
             if (result.Count == 0)
-                throw new FormatException($"「{fieldName}」欄位解析結果為空：'{field}'。");
+                throw new FormatException($"The '{fieldName}' field parsed to an empty result: '{field}'.");
             return result;
         }
 
         private static IEnumerable<int> ExpandToken(string token, int min, int max, string fieldName, bool isDayOfWeek)
         {
-            // * 萬用字元（或是 Quartz 常見的 ? 符號）
-            if (token == "*" || (token == "?" && (fieldName == "日" || fieldName == "週")))
+            // Wildcard * (or Quartz-compatible ? for day of month / day of week)
+            if (token == "*" || (token == "?" && (fieldName == "day of month" || fieldName == "day of week")))
             {
                 for (int i = min; i <= max; i++)
                     yield return Normalize(i, isDayOfWeek);
                 yield break;
             }
 
-            // 支援：*/step、range/step、以及 start/step（如 0/15、5/10）
+            // Supports: */step, range/step, and start/step (e.g. 0/15, 5/10)
             int slash = token.IndexOf('/');
             if (slash >= 0)
             {
@@ -226,7 +295,7 @@ namespace CronNET
                 yield break;
             }
 
-            // range (a-b)
+            // Range (a-b)
             if (token.IndexOf('-') >= 0)
             {
                 ParseRange(token, min, max, fieldName, isDayOfWeek, out int start, out int end);
@@ -235,7 +304,7 @@ namespace CronNET
                 yield break;
             }
 
-            // single value
+            // Single value
             yield return Normalize(ParseValue(token, min, max, fieldName, isDayOfWeek), isDayOfWeek);
         }
 
@@ -243,33 +312,33 @@ namespace CronNET
         {
             string[] parts = text.Split('-');
             if (parts.Length != 2)
-                throw new FormatException($"「{fieldName}」範圍格式錯誤：'{text}'（應為 a-b）。");
+                throw new FormatException($"Invalid range format for '{fieldName}': '{text}' (expected a-b).");
             start = ParseValue(parts[0].Trim(), min, max, fieldName, isDayOfWeek);
             end = ParseValue(parts[1].Trim(), min, max, fieldName, isDayOfWeek);
             if (start > end)
-                throw new FormatException($"「{fieldName}」範圍起始不可大於結束：'{text}'。");
+                throw new FormatException($"Range start cannot be greater than end for '{fieldName}': '{text}'.");
         }
 
         private static int ParseValue(string text, int min, int max, string fieldName, bool isDayOfWeek)
         {
             if (!int.TryParse(text, out int v))
-                throw new FormatException($"「{fieldName}」含非數字：'{text}'。");
+                throw new FormatException($"Non-numeric value found for '{fieldName}': '{text}'.");
             int effectiveMax = isDayOfWeek ? MaxDayOfWeekInput : max;
             if (v < min || v > effectiveMax)
-                throw new FormatException($"「{fieldName}」數值 {v} 超出範圍 [{min}-{effectiveMax}]。");
+                throw new FormatException($"Value {v} is out of range [{min}-{effectiveMax}] for '{fieldName}'.");
             return v;
         }
 
         private static int ParseStep(string text, string fieldName)
         {
             if (!int.TryParse(text.Trim(), out int step) || step <= 0)
-                throw new FormatException($"「{fieldName}」步進值必須為正整數：'{text}'。");
+                throw new FormatException($"Step value must be a positive integer for '{fieldName}': '{text}'.");
             return step;
         }
 
         private static int Normalize(int v, bool isDayOfWeek)
         {
-            // 週日別名 7 -> 0
+            // Normalize Sunday alias: 7 -> 0
             return (isDayOfWeek && v == MaxDayOfWeekInput) ? 0 : v;
         }
 

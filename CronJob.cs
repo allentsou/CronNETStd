@@ -4,12 +4,34 @@ using System.Threading.Tasks;
 
 namespace CronNET
 {
-    /// <summary>Job 執行失敗時攜帶的資訊。</summary>
+    /// <summary>
+    /// Event data carried when a job execution fails.
+    /// <para>排程任務執行失敗時攜帶的事件資訊。</para>
+    /// </summary>
     public sealed class JobFailedEventArgs : EventArgs
     {
+        /// <summary>
+        /// Gets the cron schedule expression.
+        /// <para>取得 Cron 排程表達式。</para>
+        /// </summary>
         public string ScheduleExpression { get; }
+
+        /// <summary>
+        /// Gets the unhandled exception that occurred.
+        /// <para>取得發生的未處理例外狀況。</para>
+        /// </summary>
         public Exception Exception { get; }
+
+        /// <summary>
+        /// Gets the timestamp when the failure occurred.
+        /// <para>取得失敗發生的時間點。</para>
+        /// </summary>
         public DateTime FailedAt { get; }
+
+        /// <summary>
+        /// Gets the job instance that failed, if available.
+        /// <para>取得失敗的任務實例（若有提供）。</para>
+        /// </summary>
         public ICronJob Job { get; }
 
         public JobFailedEventArgs(string scheduleExpression, Exception exception, DateTime failedAt, ICronJob job = null)
@@ -21,30 +43,54 @@ namespace CronNET
         }
     }
 
+    /// <summary>
+    /// Contract representing a scheduled cron job.
+    /// <para>定義 Cron 排程任務合約介面。</para>
+    /// </summary>
     public interface ICronJob
     {
+        /// <summary>
+        /// Gets the cron schedule expression for this job.
+        /// <para>取得此任務的 Cron 排程表達式。</para>
+        /// </summary>
         string ScheduleExpression { get; }
+
+        /// <summary>
+        /// Gets a value indicating whether this job is currently running.
+        /// <para>取得一個值，指出此任務目前是否正在執行中。</para>
+        /// </summary>
         bool IsRunning { get; }
 
         /// <summary>
-        /// 時間命中且無重疊執行時啟動一次。採「發射後不理」語意：
-        /// 回傳的 Task 代表該次執行，呼叫端可選擇 await 或忽略。
+        /// Triggered once when the schedule matches and no execution is overlapping. Uses fire-and-forget semantics:
+        /// the returned Task represents this execution; the caller can choose to await or ignore it.
+        /// <para>時間命中且無重疊執行時啟動一次。採「發射後不理」語意：回傳的 Task 代表該次執行，呼叫端可選擇 await 或忽略。</para>
         /// </summary>
+        /// <param name="now">The current timestamp.<para>當前時間戳記。</para></param>
+        /// <param name="daemonToken">The daemon's cancellation token.<para>守護程序的取消語彙基元。</para></param>
         Task ExecuteAsync(DateTime now, CancellationToken daemonToken);
 
         /// <summary>
-        /// 發出取消訊號後立即返回（不等待）。Job 需觀察 CancellationToken 才會提早收尾。
+        /// Signals cancellation and returns immediately (non-blocking). Handlers must observe CancellationToken to finish early.
+        /// <para>發出取消訊號後立即返回（不等待）。委派需觀察 CancellationToken 才會提早收尾。</para>
         /// </summary>
         void Cancel();
 
+        /// <summary>
+        /// Event raised when an unhandled exception occurs during execution.
+        /// <para>當任務執行發生未處理的例外時觸發的事件。</para>
+        /// </summary>
         event EventHandler<JobFailedEventArgs> Failed;
     }
 
     /// <summary>
-    /// 以 Task + CancellationToken 實作協作式取消的 Job。
-    /// 重疊執行政策：若上次仍在跑，直接跳過本次。
-    /// 注意：不接受 token 的委派（Action / ThreadStart）無法被中途取消，
-    /// Cancel() 僅能阻止下次排程；要可取消請使用接受 CancellationToken 的多載。
+    /// A Job implementing cooperative cancellation using Task + CancellationToken.
+    /// Overlap policy: skips the current execution if the previous run is still in progress.
+    /// Note: Delegates that do not accept a token (Action / ThreadStart) cannot be cancelled mid-execution;
+    /// Cancel() only prevents the next scheduled run. To support cancellation, use an overload accepting CancellationToken.
+    /// <para>以 Task + CancellationToken 實作協作式取消的 Job。</para>
+    /// <para>重疊執行政策：若上次任務仍在執行，直接跳過本次觸發。</para>
+    /// <para>注意：不接受 token 的委派（Action / ThreadStart）無法被中途取消，Cancel() 僅能阻止下次排程；要可取消請使用接受 CancellationToken 的多載。</para>
     /// </summary>
     public class CronJob : ICronJob
     {
@@ -52,7 +98,7 @@ namespace CronNET
         private readonly string _scheduleExpression;
         private readonly Func<CancellationToken, Task> _handler;
 
-        private int _running; // 0 = 閒置, 1 = 執行中
+        private int _running; // 0 = idle, 1 = running
         private readonly object _ctsLock = new object();
         private CancellationTokenSource _currentCts;
         private Task _currentTask = Task.CompletedTask;
@@ -62,7 +108,10 @@ namespace CronNET
         public string ScheduleExpression => _scheduleExpression;
         public bool IsRunning => Volatile.Read(ref _running) == 1;
 
-        /// <summary>暴露目前執行的 Task，供 Daemon 高效等待結束（避免忙碌輪詢）。</summary>
+        /// <summary>
+        /// Exposes the currently executing Task for efficient awaiting by Daemon (avoids busy polling).
+        /// <para>暴露目前執行的 Task，供 Daemon 高效等待結束（避免忙碌輪詢）。</para>
+        /// </summary>
         public Task CurrentTask
         {
             get { lock (_ctsLock) { return _currentTask; } }
@@ -71,10 +120,10 @@ namespace CronNET
         public CronJob(string schedule, Func<CancellationToken, Task> handler)
         {
             if (string.IsNullOrWhiteSpace(schedule))
-                throw new ArgumentException("排程不可為空。", nameof(schedule));
+                throw new ArgumentException("Schedule expression cannot be empty.", nameof(schedule));
             _handler = handler ?? throw new ArgumentNullException(nameof(handler));
             _scheduleExpression = schedule.Trim();
-            _schedule = new CronSchedule(_scheduleExpression); // 無效格式直接拋 FormatException
+            _schedule = new CronSchedule(_scheduleExpression); // Throws FormatException directly on invalid format
         }
 
         public CronJob(ICronSchedule schedule, Func<CancellationToken, Task> handler)
@@ -113,7 +162,7 @@ namespace CronNET
             if (!_schedule.IsTime(now))
                 return Task.CompletedTask;
 
-            // 已在執行 → 跳過
+            // Already running -> skip
             if (Interlocked.CompareExchange(ref _running, 1, 0) != 0)
                 return Task.CompletedTask;
 
@@ -129,7 +178,7 @@ namespace CronNET
                     Interlocked.Exchange(ref _running, 0);
                     throw;
                 }
-                // 收納前一次的 _currentCts（同時只會有一個 running）
+                // Store previous _currentCts (only one can run at a time)
                 var old = _currentCts;
                 _currentCts = linked;
                 if (old != null)
@@ -140,7 +189,7 @@ namespace CronNET
 
             CancellationToken token = linked.Token;
 
-            // 用 CancellationToken.None 啟動外層，讓取消只影響內層 handler，不會跳過 finally 清理
+            // Start outer task with CancellationToken.None so cancellation only affects inner handler and finally cleanup runs
             var task = Task.Run(async () =>
             {
                 try
@@ -151,11 +200,11 @@ namespace CronNET
                 }
                 catch (OperationCanceledException)
                 {
-                    // 協作式取消：正常收尾，不視為失敗
+                    // Cooperative cancellation: normal completion, not treated as failure
                 }
                 catch (Exception ex)
                 {
-                    try { OnFailed(ex); } catch { /* 事件處理器不可拖垮 Job */ }
+                    try { OnFailed(ex); } catch { /* Event handlers must not crash the job */ }
                 }
                 finally
                 {
@@ -177,7 +226,10 @@ namespace CronNET
             return task;
         }
 
-        /// <summary>發出取消訊號後立即返回，不等待執行緒結束。</summary>
+        /// <summary>
+        /// Returns immediately after signaling cancellation without waiting for threads to terminate.
+        /// <para>發出取消訊號後立即返回，不等待執行緒結束。</para>
+        /// </summary>
         public void Cancel()
         {
             lock (_ctsLock)
@@ -187,8 +239,8 @@ namespace CronNET
                     if (_currentCts != null && !_currentCts.IsCancellationRequested)
                         _currentCts.Cancel();
                 }
-                catch (ObjectDisposedException) { /* 已收尾，忽略 */ }
-                catch (Exception) { /* Cancel 期間的附帶例外，忽略 */ }
+                catch (ObjectDisposedException) { /* Already completed/disposed, ignore */ }
+                catch (Exception) { /* Incidental exceptions during Cancel(), ignore */ }
             }
         }
 
@@ -206,7 +258,7 @@ namespace CronNET
                 }
                 catch
                 {
-                    // 個別監聽者的例外不應中斷其他監聽者通知
+                    // Exceptions from individual subscribers should not interrupt notifications to other subscribers
                 }
             }
         }
