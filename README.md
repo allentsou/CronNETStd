@@ -36,6 +36,11 @@ Package Manager:
 Install-Package CronNETStd
 ```
 
+Or reference the source project directly:
+```bash
+dotnet add reference ../CronNETStd/CronNET.csproj
+```
+
 ### 🚀 Quick Start
 
 ```csharp
@@ -46,7 +51,7 @@ using CronNET;
 
 using (var daemon = new CronDaemon())
 {
-    // 1. Simple synchronous job (uninterruptible during execution, Cancel blocks next run)
+    // 1. Simple synchronous job (uninterruptible during execution, Cancel blocks subsequent runs)
     daemon.AddJob("* * * * *", (ThreadStart)(() => 
     {
         Console.WriteLine("Runs every minute");
@@ -70,7 +75,7 @@ using (var daemon = new CronDaemon())
         Console.WriteLine("Runs every day at 08:00");
     });
 
-    // Handle job failures safely (won't crash the scheduler)
+    // Handle job failures safely (won't crash the scheduler); e.Job is the failed job instance
     daemon.JobFailed += (sender, e) =>
     {
         Console.WriteLine($"[{e.FailedAt}] Job ({e.ScheduleExpression}) failed: {e.Exception.Message}");
@@ -109,7 +114,9 @@ Cron expression format (5 fields):
 │ │ │ │ │
 * * * * *
 ```
-*(Note: Day of Month and Day of Week use AND semantics—both must match).*
+Each field supports `*`, `?`, `*/n`, `start/n` (e.g. `0/15`), `a-b`, `a-b/n`, `a,b,c`, and unions such as `1,2-10/2`.
+
+*(Note: Day of Month and Day of Week use AND semantics—both must match. Standard cron usually uses OR when both are restricted.)*
 
 | Schedule | Expression | Description |
 |---|---|---|
@@ -118,11 +125,21 @@ Cron expression format (5 fields):
 | Every 15 minutes | `0/15 * * * *` or `*/15 * * * *` | Minutes: 0, 15, 30, 45 |
 | At 5, 15, 25, 35, 45, 55 min | `5/10 * * * *` | Minutes starting at 5 every 10 min |
 | Top of every hour | `0 * * * *` | Hourly at :00 |
+| Minutes 0, 1, 2 of every hour | `0,1,2 * * * *` | :00, :01, :02 |
+| Minutes 1 to 55 of every hour | `1-55 * * * *` | Every minute from :01 to :55 |
+| Every minute of hours 1, 10, 20 | `* 1,10,20 * * *` | 01:xx, 10:xx, 20:xx |
 | Every day at 08:00 | `0 8 * * *` | 08:00 daily |
+| Every day at 12:30 | `30 12 * * *` | 12:30 daily |
+| Every day at 08:00 and 20:00 | `0 8,20 * * *` | Twice daily |
+| Every 15 min between 22:00 and 23:59 | `*/15 22-23 * * *` | 22:00, 22:15 ... 23:45 |
+| Every Monday at 09:00 | `0 9 * * 1` | Monday = 1 |
 | Every weekday at 09:00 | `0 9 * * 1-5` | Mon - Fri at 09:00 |
 | Every Sunday at midnight | `0 0 * * 0` or `0 0 * * 7` | Sunday 00:00 |
 | 1st day of month at 00:00 | `0 0 1 * *` | Monthly on day 1 |
-| Weekday with `?` wildcard | `0 9 * * ?` | Compatible with Quartz `?` |
+| 1st and 15th of month at 00:00 | `0 0 1,15 * *` | Twice monthly |
+| January 1st at 00:00 | `0 0 1 1 *` | Yearly |
+| Union: minutes 1, 2, 4, 6, 8, 10 | `1,2-10/2 * * * *` | `1` plus `2-10/2` |
+| Every day at 09:00 (`?` wildcard) | `0 9 * * ?` | Same as `0 9 * * *`; compatible with Quartz `?` |
 
 ### 🔍 Validation & Prediction
 
@@ -132,12 +149,31 @@ if (CronSchedule.TryParse("0/15 * * * *", out var schedule))
 {
     // Predict next occurrence
     DateTime? nextRun = schedule.GetNextOccurrence(DateTime.Now);
-    Console.WriteLine($"Next trigger: {nextRun}");
+    Console.WriteLine($"Next trigger: {nextRun}"); // null if no match within 100 years (e.g. "0 0 31 2 *")
 }
 
 // Quick validation check
 bool isValid = CronSchedule.IsValidExpression("0 8 * * 1-5"); // true
+bool invalid = CronSchedule.IsValidExpression("60 * * * *");  // false (out of range)
 ```
+
+### ⚙️ Behavior Details
+
+1. **Minute precision**: Fires about 250ms after second 00 of each minute, at most once per minute.
+2. **Overlap skipping**: If a job's previous run is still active, the current trigger is skipped (check `IsRunning`).
+3. **Cooperative cancellation**: `Cancel()` / `Stop()` only signal. Handlers must observe the `CancellationToken` (pass it to `Task.Delay`, `HttpClient`, etc., or check `ct.IsCancellationRequested`); otherwise the current run completes. Delegates without a token (`ThreadStart` / `Action`) cannot be interrupted mid-run.
+   - `job.Cancel()` permanently disables the job (`IsCancelled` becomes true; it never fires again).
+   - `daemon.Stop()` cancels only the running executions; calling `Start()` again resumes scheduling.
+   - An `OperationCanceledException` not caused by the job's own token (e.g. an `HttpClient` timeout) is treated as a failure and raises `Failed`.
+4. **Exception isolation**: Exceptions thrown by a job never kill the scheduler; they are reported via `job.Failed` / `daemon.JobFailed`. A throwing subscriber does not prevent other subscribers from being notified.
+5. **`Stop()` never waits**: Always returns in milliseconds; use `await StopAsync(timeout)` to wait. `StopAsync` waits for tasks the daemon started for any `ICronJob`, plus `CronJob.CurrentTask`.
+6. **Idempotent `Start()`**: Calling it repeatedly is harmless; `using` / `Dispose()` calls `Stop()` automatically. Adding the same job instance twice has no effect.
+
+### 📚 API Reference
+
+- **`CronSchedule`**: `CronSchedule(expression)`, `IsTime(DateTime)`, `GetNextOccurrence(DateTime)`, cached read-only `Minutes` / `Hours` / `DaysOfMonth` / `Months` / `DaysOfWeek`, `Expression`, static `TryParse(expr, out schedule)` / `IsValidExpression(expr)`.
+- **`CronJob`**: `CronJob(schedule, handler)` where handler is `ThreadStart` / `Action` / `Action<CancellationToken>` / `Func<CancellationToken, Task>`; `ExecuteAsync(now, daemonToken)`, `Cancel()`, `IsRunning`, `IsCancelled`, `CurrentTask`, `Failed`.
+- **`CronDaemon`**: `AddJob` ×4 (including custom `ICronJob`), `RemoveJob`, `Clear`, `Start`, `Stop`, `StopAsync(timeout)` (returns `Task<bool>`), `IsRunning`, `Jobs`, `JobFailed`, `Dispose`.
 
 ---
 
@@ -169,6 +205,11 @@ Package Manager:
 Install-Package CronNETStd
 ```
 
+或直接引用原始碼專案：
+```bash
+dotnet add reference ../CronNETStd/CronNET.csproj
+```
+
 ### 🚀 快速上手
 
 ```csharp
@@ -179,7 +220,7 @@ using CronNET;
 
 using (var daemon = new CronDaemon())
 {
-    // 1. 簡易任務（執行中無法中途取消，Cancel 僅阻止下次排程）
+    // 1. 簡易任務（執行中無法中途取消，Cancel 僅阻止後續排程）
     daemon.AddJob("* * * * *", (ThreadStart)(() => 
     {
         Console.WriteLine("每分鐘執行一次");
@@ -203,7 +244,7 @@ using (var daemon = new CronDaemon())
         Console.WriteLine("每天 08:00 執行");
     });
 
-    // 統一攔截任務例外（任務錯誤不會拖垮排程器）
+    // 統一攔截任務例外（任務錯誤不會拖垮排程器；e.Job 可取得出錯的任務實例）
     daemon.JobFailed += (sender, e) =>
     {
         Console.WriteLine($"[{e.FailedAt}] 任務 ({e.ScheduleExpression}) 失敗：{e.Exception.Message}");
@@ -242,7 +283,9 @@ await daemon.StopAsync(Timeout.InfiniteTimeSpan);
 │ │ │ │ │
 * * * * *
 ```
-*(注意：日與週為 AND 語意，兩者皆命中才觸發)。*
+每欄支援：`*`、`?`、`*/n`、`start/n`（如 `0/15`）、`a-b`、`a-b/n`、`a,b,c`，以及逗號聯集（如 `1,2-10/2`）。
+
+*(注意：日與週為 AND 語意，兩者皆命中才觸發；標準 cron 在兩者皆有限制時多為 OR)。*
 
 | 需求 | 寫法 | 說明 |
 |---|---|---|
@@ -251,11 +294,21 @@ await daemon.StopAsync(Timeout.InfiniteTimeSpan);
 | 每 15 分鐘 | `0/15 * * * *` 或 `*/15 * * * *` | 0, 15, 30, 45 分 |
 | 從第 5 分起每 10 分 | `5/10 * * * *` | 5, 15, 25, 35, 45, 55 分 |
 | 每小時整點 | `0 * * * *` | 每小時 00 分 |
+| 每小時的 0、1、2 分 | `0,1,2 * * * *` | 00、01、02 分 |
+| 每小時第 1～55 分鐘每分鐘 | `1-55 * * * *` | 01 到 55 分每分鐘 |
+| 每天 1、10、20 點的每分鐘 | `* 1,10,20 * * *` | 01:xx、10:xx、20:xx |
 | 每天 08:00 | `0 8 * * *` | 每天早上八點 |
+| 每天 12:30 | `30 12 * * *` | 每天 12:30 |
+| 每天 08:00 與 20:00 | `0 8,20 * * *` | 每天兩次 |
+| 每晚 22～23 點每 15 分 | `*/15 22-23 * * *` | 22:00、22:15 … 23:45 |
+| 每週一 09:00 | `0 9 * * 1` | 週一 = 1 |
 | 每個工作日 09:00 | `0 9 * * 1-5` | 週一至週五 09:00 |
 | 每週日 00:00 | `0 0 * * 0` 或 `0 0 * * 7` | 週日 00:00 |
 | 每月 1 號 00:00 | `0 0 1 * *` | 每月 1 號 00:00 |
-| 支援 `?` 萬用字元 | `0 9 * * ?` | 相容 Quartz 的 `?` 語法 |
+| 每月 1 號與 15 號 00:00 | `0 0 1,15 * *` | 每月兩次 |
+| 每年 1/1 00:00 | `0 0 1 1 *` | 每年一次 |
+| 混合：分鐘 1、2、4、6、8、10 | `1,2-10/2 * * * *` | `1` 加上 `2-10/2` |
+| 每天 09:00（`?` 萬用字元） | `0 9 * * ?` | 等同 `0 9 * * *`；相容 Quartz 的 `?` 語法 |
 
 ### 🔍 驗證與預測下次執行時間
 
@@ -265,12 +318,31 @@ if (CronSchedule.TryParse("0/15 * * * *", out var schedule))
 {
     // 預算下一次觸發時間點
     DateTime? nextRun = schedule.GetNextOccurrence(DateTime.Now);
-    Console.WriteLine($"下次執行時間：{nextRun}");
+    Console.WriteLine($"下次執行時間：{nextRun}"); // 100 年內無符合時間（如 "0 0 31 2 *"）則為 null
 }
 
 // 靜態快速驗證格式
 bool isValid = CronSchedule.IsValidExpression("0 8 * * 1-5"); // true
+bool invalid = CronSchedule.IsValidExpression("60 * * * *");  // false（超出範圍）
 ```
+
+### ⚙️ 行為細節
+
+1. **分鐘精度**：排程在「每分鐘 00 秒過後約 250ms」觸發；同一分鐘最多觸發一次。
+2. **重疊跳過**：某 job 上次還沒跑完，本次直接跳過（可用 `IsRunning` 查詢）。
+3. **取消是協作式**：`Cancel()` / `Stop()` 只發訊號。handler 必須觀察 `CancellationToken`（傳給 `Task.Delay` / HttpClient 等，或檢查 `ct.IsCancellationRequested`），否則該次會跑完；不接受 token 的委派（`ThreadStart` / `Action`）無法中途停止。
+   - `job.Cancel()` 會永久停用該 job（`IsCancelled` 為 true，之後不再觸發）。
+   - `daemon.Stop()` 只取消執行中的那次，之後再 `Start()` 仍會照常排程。
+   - handler 拋出非本身 token 造成的 `OperationCanceledException`（例如 HttpClient 逾時）會視為失敗並觸發 `Failed`。
+4. **例外隔離**：job 內拋例外不會殺掉排程，會經 `job.Failed` / `daemon.JobFailed` 事件送出；某個訂閱者拋例外也不影響其他訂閱者收到通知。
+5. **`Stop()` 不等待**：一律毫秒級返回；要等請用 `await StopAsync(timeout)`。`StopAsync` 會等待 daemon 為任何 `ICronJob` 啟動的任務，以及 `CronJob.CurrentTask`。
+6. **`Start()` 冪等**：重複呼叫無害；`using` / `Dispose()` 會自動 `Stop()`。同一個 job 實例重複加入不會有效果。
+
+### 📚 API 一覽
+
+- **`CronSchedule`**：`CronSchedule(expression)`、`IsTime(DateTime)`、`GetNextOccurrence(DateTime)`、快取唯讀的 `Minutes` / `Hours` / `DaysOfMonth` / `Months` / `DaysOfWeek`、`Expression`、靜態 `TryParse(expr, out schedule)` / `IsValidExpression(expr)`。
+- **`CronJob`**：`CronJob(schedule, handler)`，handler 可為 `ThreadStart` / `Action` / `Action<CancellationToken>` / `Func<CancellationToken, Task>`；`ExecuteAsync(now, daemonToken)`、`Cancel()`、`IsRunning`、`IsCancelled`、`CurrentTask`、`Failed`。
+- **`CronDaemon`**：`AddJob` ×4（支援自訂 `ICronJob`）、`RemoveJob`、`Clear`、`Start`、`Stop`、`StopAsync(timeout)`（回傳 `Task<bool>`）、`IsRunning`、`Jobs`、`JobFailed`、`Dispose`。
 
 ---
 

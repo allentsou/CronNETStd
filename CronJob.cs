@@ -71,8 +71,9 @@ namespace CronNET
         Task ExecuteAsync(DateTime now, CancellationToken daemonToken);
 
         /// <summary>
-        /// Signals cancellation and returns immediately (non-blocking). Handlers must observe CancellationToken to finish early.
-        /// <para>發出取消訊號後立即返回（不等待）。委派需觀察 CancellationToken 才會提早收尾。</para>
+        /// Signals cancellation to the running execution and prevents all subsequent scheduled runs; returns immediately (non-blocking).
+        /// Handlers must observe CancellationToken to finish the current run early.
+        /// <para>對執行中的任務發出取消訊號，並阻止後續所有排程執行；立即返回（不等待）。委派需觀察 CancellationToken 才會提早結束本次執行。</para>
         /// </summary>
         void Cancel();
 
@@ -87,10 +88,10 @@ namespace CronNET
     /// A Job implementing cooperative cancellation using Task + CancellationToken.
     /// Overlap policy: skips the current execution if the previous run is still in progress.
     /// Note: Delegates that do not accept a token (Action / ThreadStart) cannot be cancelled mid-execution;
-    /// Cancel() only prevents the next scheduled run. To support cancellation, use an overload accepting CancellationToken.
+    /// Cancel() only prevents subsequent scheduled runs. To support cancellation, use an overload accepting CancellationToken.
     /// <para>以 Task + CancellationToken 實作協作式取消的 Job。</para>
     /// <para>重疊執行政策：若上次任務仍在執行，直接跳過本次觸發。</para>
-    /// <para>注意：不接受 token 的委派（Action / ThreadStart）無法被中途取消，Cancel() 僅能阻止下次排程；要可取消請使用接受 CancellationToken 的多載。</para>
+    /// <para>注意：不接受 token 的委派（Action / ThreadStart）無法被中途取消，Cancel() 僅能阻止後續排程；要可取消請使用接受 CancellationToken 的多載。</para>
     /// </summary>
     public class CronJob : ICronJob
     {
@@ -102,11 +103,21 @@ namespace CronNET
         private readonly object _ctsLock = new object();
         private CancellationTokenSource _currentCts;
         private Task _currentTask = Task.CompletedTask;
+        private bool _cancelled; // Guarded by _ctsLock; once set, no further runs start
 
         public event EventHandler<JobFailedEventArgs> Failed;
 
         public string ScheduleExpression => _scheduleExpression;
         public bool IsRunning => Volatile.Read(ref _running) == 1;
+
+        /// <summary>
+        /// Gets a value indicating whether <see cref="Cancel"/> has been called; a cancelled job never runs again.
+        /// <para>取得一個值，指出是否已呼叫 <see cref="Cancel"/>；已取消的任務不會再執行。</para>
+        /// </summary>
+        public bool IsCancelled
+        {
+            get { lock (_ctsLock) { return _cancelled; } }
+        }
 
         /// <summary>
         /// Exposes the currently executing Task for efficient awaiting by Daemon (avoids busy polling).
@@ -167,8 +178,17 @@ namespace CronNET
                 return Task.CompletedTask;
 
             CancellationTokenSource linked;
+            Task task;
+            Task<Task> outer;
             lock (_ctsLock)
             {
+                // Checked under the lock so a concurrent Cancel() cannot slip between the check and CTS creation
+                if (_cancelled)
+                {
+                    Interlocked.Exchange(ref _running, 0);
+                    return Task.CompletedTask;
+                }
+
                 try
                 {
                     linked = CancellationTokenSource.CreateLinkedTokenSource(daemonToken);
@@ -185,63 +205,85 @@ namespace CronNET
                 {
                     try { old.Dispose(); } catch { /* ignore */ }
                 }
-            }
 
-            CancellationToken token = linked.Token;
-
-            // Start outer task with CancellationToken.None so cancellation only affects inner handler and finally cleanup runs
-            var task = Task.Run(async () =>
-            {
-                try
-                {
-                    var inner = _handler(token);
-                    if (inner != null)
-                        await inner.ConfigureAwait(false);
-                }
-                catch (OperationCanceledException)
-                {
-                    // Cooperative cancellation: normal completion, not treated as failure
-                }
-                catch (Exception ex)
-                {
-                    try { OnFailed(ex); } catch { /* Event handlers must not crash the job */ }
-                }
-                finally
-                {
-                    Interlocked.Exchange(ref _running, 0);
-                    lock (_ctsLock)
-                    {
-                        if (ReferenceEquals(_currentCts, linked))
-                            _currentCts = null;
-                    }
-                    try { linked.Dispose(); } catch { /* ignore */ }
-                }
-            }, CancellationToken.None);
-
-            lock (_ctsLock)
-            {
+                // Create the task cold and publish it as CurrentTask before it starts, so observers
+                // (e.g. CronDaemon.StopAsync) never see a stale completed task while this run is in flight.
+                // CancellationToken.None: cancellation only affects the inner handler, and the finally cleanup always runs.
+                outer = new Task<Task>(() => RunAsync(linked), CancellationToken.None, TaskCreationOptions.DenyChildAttach);
+                task = outer.Unwrap();
                 _currentTask = task;
             }
 
+            outer.Start(TaskScheduler.Default);
             return task;
         }
 
+        private async Task RunAsync(CancellationTokenSource linked)
+        {
+            CancellationToken token = linked.Token;
+            try
+            {
+                var inner = _handler(token);
+                if (inner != null)
+                    await inner.ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (token.IsCancellationRequested)
+            {
+                // Cooperative cancellation caused by our own token: normal completion, not treated as failure.
+                // Other OperationCanceledExceptions (e.g. HttpClient timeouts) fall through and are reported as failures.
+            }
+            catch (Exception ex)
+            {
+                try { OnFailed(ex); } catch { /* Event handlers must not crash the job */ }
+            }
+            finally
+            {
+                lock (_ctsLock)
+                {
+                    if (ReferenceEquals(_currentCts, linked))
+                        _currentCts = null;
+                }
+                try { linked.Dispose(); } catch { /* ignore */ }
+                Interlocked.Exchange(ref _running, 0);
+            }
+        }
+
         /// <summary>
-        /// Returns immediately after signaling cancellation without waiting for threads to terminate.
-        /// <para>發出取消訊號後立即返回，不等待執行緒結束。</para>
+        /// Signals cancellation to the running execution and prevents all subsequent scheduled runs.
+        /// Returns immediately without waiting for the current run to finish.
+        /// <para>對執行中的任務發出取消訊號，並阻止後續所有排程執行。立即返回，不等待本次執行結束。</para>
         /// </summary>
         public void Cancel()
         {
             lock (_ctsLock)
             {
-                try
-                {
-                    if (_currentCts != null && !_currentCts.IsCancellationRequested)
-                        _currentCts.Cancel();
-                }
-                catch (ObjectDisposedException) { /* Already completed/disposed, ignore */ }
-                catch (Exception) { /* Incidental exceptions during Cancel(), ignore */ }
+                _cancelled = true;
+                CancelCurrentLocked();
             }
+        }
+
+        /// <summary>
+        /// Signals cancellation to the running execution only; future scheduled runs are still allowed.
+        /// Used by <see cref="CronDaemon.Stop"/> so the daemon can be restarted.
+        /// <para>僅對執行中的任務發出取消訊號，不影響後續排程。供 <see cref="CronDaemon.Stop"/> 使用，讓 daemon 可重新啟動。</para>
+        /// </summary>
+        internal void CancelCurrentRun()
+        {
+            lock (_ctsLock)
+            {
+                CancelCurrentLocked();
+            }
+        }
+
+        private void CancelCurrentLocked()
+        {
+            try
+            {
+                if (_currentCts != null && !_currentCts.IsCancellationRequested)
+                    _currentCts.Cancel();
+            }
+            catch (ObjectDisposedException) { /* Already completed/disposed, ignore */ }
+            catch (Exception) { /* Incidental exceptions during Cancel(), ignore */ }
         }
 
         private void OnFailed(Exception ex)

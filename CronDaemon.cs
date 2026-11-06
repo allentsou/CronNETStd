@@ -13,8 +13,8 @@ namespace CronNET
     public interface ICronDaemon : IDisposable
     {
         /// <summary>
-        /// Adds a simple task (cannot be cancelled mid-execution, Cancel only prevents next schedule). Returns job for tracking/removal.
-        /// <para>新增簡易任務（不可中途取消，Cancel 僅阻止下次排程）。回傳 job 以便追蹤或移除。</para>
+        /// Adds a simple task (cannot be cancelled mid-execution, Cancel only prevents subsequent runs). Returns job for tracking/removal.
+        /// <para>新增簡易任務（不可中途取消，Cancel 僅阻止後續排程）。回傳 job 以便追蹤或移除。</para>
         /// </summary>
         ICronJob AddJob(string schedule, ThreadStart action);
 
@@ -57,9 +57,10 @@ namespace CronNET
 
         /// <summary>
         /// After signaling cancellation, waits up to timeout for running tasks to finish (does not forcibly abort).
-        /// <para>發出取消訊號後，最多等待 timeout 讓執行中任務收尾（不會強制終止）。</para>
+        /// Returns true if all running tasks finished, false if the timeout elapsed first.
+        /// <para>發出取消訊號後，最多等待 timeout 讓執行中任務收尾（不會強制終止）。回傳 true 表示全部結束，false 表示逾時。</para>
         /// </summary>
-        Task StopAsync(TimeSpan timeout);
+        Task<bool> StopAsync(TimeSpan timeout);
 
         /// <summary>
         /// Gets a value indicating whether the scheduler daemon is running.
@@ -92,6 +93,11 @@ namespace CronNET
         private readonly object _sync = new object();
         private readonly List<ICronJob> _jobs = new List<ICronJob>();
         private readonly EventHandler<JobFailedEventArgs> _jobFailedForwarder;
+
+        // Tasks started by OnTick, per job, so StopAsync can await any ICronJob implementation (guarded by _sync)
+        private readonly Dictionary<ICronJob, Task> _inFlight = new Dictionary<ICronJob, Task>();
+        // Held by OnTick while dispatching; StopAsync waits on it so tasks started by a concurrent tick are not missed
+        private readonly SemaphoreSlim _dispatchGate = new SemaphoreSlim(1, 1);
 
         private System.Threading.Timer _timer;
         private CancellationTokenSource _daemonCts;
@@ -127,15 +133,21 @@ namespace CronNET
         {
             _jobFailedForwarder = (s, e) =>
             {
-                try { JobFailed?.Invoke(this, e); } catch { /* Observer exceptions must not crash scheduler */ }
+                var handler = JobFailed;
+                if (handler == null) return;
+                foreach (EventHandler<JobFailedEventArgs> sub in handler.GetInvocationList())
+                {
+                    // Each subscriber is isolated: one throwing must not prevent the others from being notified
+                    try { sub(this, e); } catch { /* Observer exceptions must not crash scheduler */ }
+                }
             };
         }
 
         #region Add / Remove
 
         /// <summary>
-        /// Adds a simple task (cannot be cancelled mid-execution, Cancel only prevents next schedule).
-        /// <para>新增簡易任務（不可中途取消，Cancel 僅阻止下次排程）。</para>
+        /// Adds a simple task (cannot be cancelled mid-execution, Cancel only prevents subsequent runs).
+        /// <para>新增簡易任務（不可中途取消，Cancel 僅阻止後續排程）。</para>
         /// <para>Fields: minute hour day month day-of-week</para>
         /// <para>* * * * *         Every minute (每分鐘)</para>
         /// <para>0 * * * *         Top of every hour (每小時整點)</para>
@@ -180,31 +192,33 @@ namespace CronNET
         }
 
         /// <summary>
-        /// Adds a custom ICronJob instance.
-        /// <para>新增自訂的 ICronJob 實例。</para>
+        /// Adds a custom ICronJob instance. Adding the same instance again has no effect.
+        /// <para>新增自訂的 ICronJob 實例。重複加入同一個實例不會有任何效果。</para>
         /// </summary>
         public ICronJob AddJob(ICronJob job)
         {
             if (job == null) throw new ArgumentNullException(nameof(job));
-            job.Failed += _jobFailedForwarder;
-            lock (_sync)
-            {
-                ThrowIfDisposed();
-                _jobs.Add(job);
-            }
+            AddJobCore(job);
             return job;
         }
 
         private ICronJob AddJobInternal(string schedule, Func<CancellationToken, Task> handler)
         {
             var job = new CronJob(schedule, handler); // Format errors throw here; job won't be added
-            job.Failed += _jobFailedForwarder;
+            AddJobCore(job);
+            return job;
+        }
+
+        private void AddJobCore(ICronJob job)
+        {
             lock (_sync)
             {
+                // Validate before subscribing so a rejected job is left untouched
                 ThrowIfDisposed();
+                if (_jobs.Contains(job)) return;
                 _jobs.Add(job);
+                job.Failed += _jobFailedForwarder;
             }
-            return job;
         }
 
         /// <summary>
@@ -218,6 +232,7 @@ namespace CronNET
             {
                 if (_jobs.Remove(job))
                 {
+                    _inFlight.Remove(job);
                     job.Failed -= _jobFailedForwarder;
                     try { job.Cancel(); } catch { /* ignore */ }
                     return true;
@@ -237,6 +252,7 @@ namespace CronNET
             {
                 snapshot = _jobs.ToArray();
                 _jobs.Clear();
+                _inFlight.Clear();
             }
             foreach (var j in snapshot)
             {
@@ -296,52 +312,77 @@ namespace CronNET
             {
                 foreach (var job in snapshot)
                 {
-                    try { job.Cancel(); } catch { /* ignore */ }
+                    try
+                    {
+                        // CronJob.Cancel() would permanently disable the job; Stop must keep jobs restartable via Start()
+                        if (job is CronJob cj) cj.CancelCurrentRun();
+                        else job.Cancel();
+                    }
+                    catch { /* ignore */ }
                 }
             }
             // Note: Do not Dispose cts immediately here to prevent ObjectDisposedException if running jobs access WaitHandle or callbacks
         }
 
-        Task ICronDaemon.StopAsync(TimeSpan timeout) => StopAsync(timeout);
-
         /// <summary>
         /// After signaling cancellation, waits up to timeout for running tasks to finish (returns true if all finished, false if timed out).
         /// Supports Timeout.InfiniteTimeSpan for indefinite wait. Uses Task.WhenAll to avoid busy polling.
+        /// Waits for tasks started by this daemon for any <see cref="ICronJob"/>, plus <see cref="CronJob.CurrentTask"/>.
         /// <para>發出取消訊號後，最多等待 timeout 讓執行中任務收尾（回傳 true 表示全部正常結束，false 表示逾時）。</para>
         /// <para>支援 Timeout.InfiniteTimeSpan 無限等待。改用 Task.WhenAll 避免忙碌輪詢。</para>
+        /// <para>會等待此 daemon 為任何 <see cref="ICronJob"/> 啟動的任務，以及 <see cref="CronJob.CurrentTask"/>。</para>
         /// </summary>
         public async Task<bool> StopAsync(TimeSpan timeout)
         {
             if (timeout < TimeSpan.Zero && timeout != Timeout.InfiniteTimeSpan)
                 throw new ArgumentOutOfRangeException(nameof(timeout), "Timeout must be greater than or equal to zero, or Timeout.InfiniteTimeSpan.");
 
-            ICronJob[] snapshot;
-            lock (_sync) { snapshot = _jobs.ToArray(); }
+            bool infinite = timeout == Timeout.InfiniteTimeSpan;
+            var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+
             Stop(); // Signal cancellation first (non-blocking)
 
-            if (snapshot == null || snapshot.Length == 0) return true;
+            // Wait for a tick that is dispatching right now, so the tasks it starts are tracked below
+            if (!await _dispatchGate.WaitAsync(timeout).ConfigureAwait(false))
+                return false;
+            _dispatchGate.Release();
 
-            var runningTasks = new List<Task>();
-            foreach (var job in snapshot)
+            var runningTasks = new HashSet<Task>();
+            lock (_sync)
             {
-                if (job is CronJob cj && cj.CurrentTask != null && !cj.CurrentTask.IsCompleted)
+                foreach (var task in _inFlight.Values)
                 {
-                    runningTasks.Add(cj.CurrentTask);
+                    if (!task.IsCompleted) runningTasks.Add(task);
+                }
+                foreach (var job in _jobs)
+                {
+                    if (job is CronJob cj)
+                    {
+                        var current = cj.CurrentTask;
+                        if (current != null && !current.IsCompleted) runningTasks.Add(current);
+                    }
                 }
             }
 
             if (runningTasks.Count == 0) return true;
 
             Task allTasks = Task.WhenAll(runningTasks);
-            if (timeout == Timeout.InfiniteTimeSpan)
+            if (infinite)
             {
                 await allTasks.ConfigureAwait(false);
                 return true;
             }
 
-            var delayTask = Task.Delay(timeout);
-            var completed = await Task.WhenAny(allTasks, delayTask).ConfigureAwait(false);
-            return completed == allTasks;
+            TimeSpan remaining = timeout - stopwatch.Elapsed;
+            if (remaining < TimeSpan.Zero) remaining = TimeSpan.Zero;
+
+            using (var delayCts = new CancellationTokenSource())
+            {
+                var delayTask = Task.Delay(remaining, delayCts.Token);
+                var completed = await Task.WhenAny(allTasks, delayTask).ConfigureAwait(false);
+                delayCts.Cancel(); // Release the delay timer immediately instead of keeping it alive until timeout
+                return completed == allTasks;
+            }
         }
 
         #endregion
@@ -374,17 +415,33 @@ namespace CronNET
 
             if (snapshot != null && !token.IsCancellationRequested)
             {
-                foreach (var job in snapshot)
+                _dispatchGate.Wait();
+                try
                 {
-                    try
+                    foreach (var job in snapshot)
                     {
-                        // Fire and forget: caller does not await; job tracks IsRunning internally
-                        var _ = job.ExecuteAsync(now, token);
+                        if (token.IsCancellationRequested) break;
+                        try
+                        {
+                            // Fire and forget: not awaited here; tracked so StopAsync can wait for it
+                            var task = job.ExecuteAsync(now, token);
+                            if (task != null && !task.IsCompleted)
+                            {
+                                lock (_sync)
+                                {
+                                    if (_jobs.Contains(job)) _inFlight[job] = task;
+                                }
+                            }
+                        }
+                        catch
+                        {
+                            // ExecuteAsync should not throw (exceptions trigger Failed event); this is the last line of defense
+                        }
                     }
-                    catch
-                    {
-                        // ExecuteAsync should not throw (exceptions trigger Failed event); this is the last line of defense
-                    }
+                }
+                finally
+                {
+                    _dispatchGate.Release();
                 }
             }
 

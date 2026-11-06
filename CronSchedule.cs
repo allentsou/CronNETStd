@@ -122,7 +122,8 @@ namespace CronNET
                 _hours = ParseField(fields[1], MinHour, MaxHour, "hour", false);
                 _daysOfMonth = ParseField(fields[2], MinDayOfMonth, MaxDayOfMonth, "day of month", false);
                 _months = ParseField(fields[3], MinMonth, MaxMonth, "month", false);
-                _daysOfWeek = ParseField(fields[4], MinDayOfWeek, MaxDayOfWeekInput, "day of week", true);
+                // Real range 0-6 drives wildcard/step expansion; ParseValue still accepts 7 as a Sunday alias
+                _daysOfWeek = ParseField(fields[4], MinDayOfWeek, MaxDayOfWeek, "day of week", true);
 
                 _readOnlyMinutes = new ReadOnlyCollection<int>(_minutes.OrderBy(x => x).ToList());
                 _readOnlyHours = new ReadOnlyCollection<int>(_hours.OrderBy(x => x).ToList());
@@ -190,41 +191,55 @@ namespace CronNET
                    _daysOfWeek.Contains((int)dateTime.DayOfWeek);
         }
 
+        // Search horizon for GetNextOccurrence. Long enough for rare combinations such as Feb 29 on a given
+        // weekday (gaps can exceed 28 years across non-leap century years), still cheap because the scan skips whole months/days/hours.
+        private const int SearchHorizonYears = 100;
+
         /// <summary>
-        /// Predicts the next occurrence time after the specified reference time. Returns null if no match within 1 year.
-        /// <para>預測指定時間點之後的下一次觸發時間。若 1 年內無符合時間則回傳 null。</para>
+        /// Predicts the next occurrence time after the specified reference time. Returns null if no match within 100 years
+        /// (e.g. impossible dates such as "0 0 31 2 *").
+        /// <para>預測指定時間點之後的下一次觸發時間。若 100 年內無符合時間（例如不存在的日期 "0 0 31 2 *"）則回傳 null。</para>
         /// </summary>
         /// <param name="fromTime">The reference starting time.<para>起算基準時間。</para></param>
-        /// <returns>The next matching trigger time, or null if not found within a year.<para>下一次觸發時間，若一年內無匹配則為 null。</para></returns>
+        /// <returns>The next matching trigger time, or null if not found within 100 years.<para>下一次觸發時間，若 100 年內無匹配則為 null。</para></returns>
         public DateTime? GetNextOccurrence(DateTime fromTime)
         {
-            DateTime cur = new DateTime(fromTime.Year, fromTime.Month, fromTime.Day, fromTime.Hour, fromTime.Minute, 0, fromTime.Kind).AddMinutes(1);
-            DateTime max = cur.AddYears(1);
-
-            while (cur < max)
+            try
             {
-                if (!_months.Contains(cur.Month))
+                DateTime cur = new DateTime(fromTime.Year, fromTime.Month, fromTime.Day, fromTime.Hour, fromTime.Minute, 0, fromTime.Kind).AddMinutes(1);
+                DateTime max = cur.Year > DateTime.MaxValue.Year - SearchHorizonYears
+                    ? DateTime.MaxValue
+                    : cur.AddYears(SearchHorizonYears);
+
+                while (cur < max)
                 {
-                    cur = new DateTime(cur.Year, cur.Month, 1, 0, 0, 0, cur.Kind).AddMonths(1);
-                    continue;
+                    if (!_months.Contains(cur.Month))
+                    {
+                        cur = new DateTime(cur.Year, cur.Month, 1, 0, 0, 0, cur.Kind).AddMonths(1);
+                        continue;
+                    }
+
+                    if (!_daysOfMonth.Contains(cur.Day) || !_daysOfWeek.Contains((int)cur.DayOfWeek))
+                    {
+                        cur = new DateTime(cur.Year, cur.Month, cur.Day, 0, 0, 0, cur.Kind).AddDays(1);
+                        continue;
+                    }
+
+                    if (!_hours.Contains(cur.Hour))
+                    {
+                        cur = new DateTime(cur.Year, cur.Month, cur.Day, cur.Hour, 0, 0, cur.Kind).AddHours(1);
+                        continue;
+                    }
+
+                    if (_minutes.Contains(cur.Minute))
+                        return cur;
+
+                    cur = cur.AddMinutes(1);
                 }
-
-                if (!_daysOfMonth.Contains(cur.Day) || !_daysOfWeek.Contains((int)cur.DayOfWeek))
-                {
-                    cur = new DateTime(cur.Year, cur.Month, cur.Day, 0, 0, 0, cur.Kind).AddDays(1);
-                    continue;
-                }
-
-                if (!_hours.Contains(cur.Hour))
-                {
-                    cur = new DateTime(cur.Year, cur.Month, cur.Day, cur.Hour, 0, 0, cur.Kind).AddHours(1);
-                    continue;
-                }
-
-                if (_minutes.Contains(cur.Minute))
-                    return cur;
-
-                cur = cur.AddMinutes(1);
+            }
+            catch (ArgumentOutOfRangeException)
+            {
+                // Walked past DateTime.MaxValue: no further occurrence is representable
             }
 
             return null;
@@ -284,7 +299,14 @@ namespace CronNET
                 else
                 {
                     start = ParseValue(left, min, max, fieldName, isDayOfWeek);
-                    end = isDayOfWeek ? MaxDayOfWeekInput : max;
+                    // start/step runs to the field's real maximum (day of week: 6), so e.g. "1/2" = 1,3,5 without an implicit Sunday
+                    end = max;
+                    if (start > end)
+                    {
+                        // Only possible for the day-of-week alias 7 (e.g. "7/2"): Sunday alone
+                        yield return Normalize(start, isDayOfWeek);
+                        yield break;
+                    }
                 }
 
                 for (int i = start; i <= end; i++)
